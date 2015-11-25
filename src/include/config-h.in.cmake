@@ -6,6 +6,9 @@
 /* fallocate(2) is supported */
 #cmakedefine CEPH_HAVE_FALLOCATE 
 
+/* mallinfo(3) is supported */
+#cmakedefine HAVE_MALLINFO
+
 /* posix_fadvise is supported */
 #cmakedefine HAVE_POSIX_FADVISE
 
@@ -233,5 +236,11 @@
 #cmakedefine HAVE_GPERFTOOLS_HEAP_PROFILER_H
 #cmakedefine HAVE_GPERFTOOLS_MALLOC_EXTENSION_H
 #cmakedefine HAVE_GPERFTOOLS_PROFILER_H
+
+/* res_nquery is supported */
+#cmakedefine HAVE_RES_NQUERY
+
+/* res_query is thread safe */
+#cmakedefine HAVE_THREAD_SAFE_RES_QUERY
 
 #endif /* CONFIG_H */

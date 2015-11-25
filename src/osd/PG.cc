@@ -45,7 +45,11 @@
 #include "common/BackTrace.h"
 
 #ifdef WITH_LTTNG
+#define TRACEPOINT_DEFINE
+#define TRACEPOINT_PROBE_DYNAMIC_LINKAGE
 #include "tracing/pg.h"
+#undef TRACEPOINT_PROBE_DYNAMIC_LINKAGE
+#undef TRACEPOINT_DEFINE
 #else
 #define tracepoint(...)
 #endif
@@ -2035,7 +2039,7 @@ bool PG::queue_scrub()
     state_set(PG_STATE_DEEP_SCRUB);
     scrubber.must_deep_scrub = false;
   }
-  if (scrubber.must_repair) {
+  if (scrubber.must_repair || scrubber.auto_repair) {
     state_set(PG_STATE_REPAIR);
     scrubber.must_repair = false;
   }
@@ -2521,7 +2525,6 @@ void PG::publish_stats_to_osd()
 
   utime_t now = ceph_clock_now(cct);
   if (info.stats.state != state) {
-    info.stats.state = state;
     info.stats.last_change = now;
     if ((state & PG_STATE_ACTIVE) &&
 	!(info.stats.state & PG_STATE_ACTIVE))
@@ -2529,6 +2532,7 @@ void PG::publish_stats_to_osd()
     if ((state & (PG_STATE_ACTIVE|PG_STATE_PEERED)) &&
 	!(info.stats.state & (PG_STATE_ACTIVE|PG_STATE_PEERED)))
       info.stats.last_became_peered = now;
+    info.stats.state = state;
   }
 
   _update_calc_stats();
@@ -2644,13 +2648,53 @@ void PG::init(
   write_if_dirty(*t);
 }
 
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 void PG::upgrade(ObjectStore *store)
 {
   assert(info_struct_v <= 8);
   ObjectStore::Transaction t;
 
-  assert(0 == "no support for pre v8");
+  assert(info_struct_v == 7);
+
+  // 7 -> 8
+  pg_log.mark_log_for_rewrite();
+  ghobject_t log_oid(OSD::make_pg_log_oid(pg_id));
+  ghobject_t biginfo_oid(OSD::make_pg_biginfo_oid(pg_id));
+  t.remove(coll_t::meta(), log_oid);
+  t.remove(coll_t::meta(), biginfo_oid);
+  t.collection_rmattr(coll, "info");
+
+  t.touch(coll, pgmeta_oid);
+  map<string,bufferlist> v;
+  __u8 ver = cur_struct_v;
+  ::encode(ver, v[infover_key]);
+  t.omap_setkeys(coll, pgmeta_oid, v);
+
+  dirty_info = true;
+  dirty_big_info = true;
+  write_if_dirty(t);
+
+  ceph::shared_ptr<ObjectStore::Sequencer> osr(
+    new ObjectStore::Sequencer("upgrade"));
+  int r = store->apply_transaction(osr.get(), t);
+  if (r != 0) {
+    derr << __func__ << ": apply_transaction returned "
+	 << cpp_strerror(r) << dendl;
+    assert(0);
+  }
+  assert(r == 0);
+
+  C_SaferCond waiter;
+  if (!osr->flush_commit(&waiter)) {
+    waiter.wait();
+  }
 }
+
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic warning "-Wpragmas"
 
 int PG::_prepare_write_info(map<string,bufferlist> *km,
 			    epoch_t epoch,
@@ -2721,6 +2765,10 @@ void PG::prepare_write_info(map<string,bufferlist> *km)
   dirty_big_info = false;
 }
 
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 bool PG::_has_removal_flag(ObjectStore *store,
 			   spg_t pgid)
 {
@@ -2735,6 +2783,10 @@ bool PG::_has_removal_flag(ObjectStore *store,
       values.size() == 1)
     return true;
 
+  // try old way.  tolerate EOPNOTSUPP.
+  char val;
+  if (store->collection_getattr(coll, "remove", &val, 1) > 0)
+    return true;
   return false;
 }
 
@@ -2760,25 +2812,57 @@ int PG::peek_map_epoch(ObjectStore *store,
   keys.insert(epoch_key);
   map<string,bufferlist> values;
   int r = store->omap_get_values(coll, pgmeta_oid, keys, &values);
-  if (r != 0) {
-    // probably bug 10617; see OSD::load_pgs()
-    return -1;
+  if (r == 0) {
+    assert(values.size() == 2);
+
+    // sanity check version
+    bufferlist::iterator bp = values[infover_key].begin();
+    __u8 struct_v = 0;
+    ::decode(struct_v, bp);
+    assert(struct_v >= 8);
+
+    // get epoch
+    bp = values[epoch_key].begin();
+    ::decode(cur_epoch, bp);
+  } else if (r == -ENOENT) {
+    // legacy: try v7 or older
+    r = store->collection_getattr(coll, "info", *bl);
+    if (r <= 0) {
+      // probably bug 10617; see OSD::load_pgs()
+      return -1;
+    }
+    bufferlist::iterator bp = bl->begin();
+    __u8 struct_v = 0;
+    ::decode(struct_v, bp);
+    assert(struct_v >= 5);
+    if (struct_v < 6) {
+      ::decode(cur_epoch, bp);
+      *pepoch = cur_epoch;
+      return cur_epoch;
+    }
+
+    // get epoch out of leveldb
+    string ek = get_epoch_key(pgid);
+    keys.clear();
+    values.clear();
+    keys.insert(ek);
+    store->omap_get_values(coll_t::meta(), legacy_infos_oid, keys, &values);
+    if (values.size() < 1) {
+      // probably bug 10617; see OSD::load_pgs()
+      return -1;
+    }
+    bufferlist::iterator p = values[ek].begin();
+    ::decode(cur_epoch, p);
+  } else {
+    assert(0 == "unable to open pg metadata");
   }
-  assert(values.size() == 2);
-
-  // sanity check version
-  bufferlist::iterator bp = values[infover_key].begin();
-  __u8 struct_v = 0;
-  ::decode(struct_v, bp);
-  assert(struct_v >= 8);
-
-  // get epoch
-  bp = values[epoch_key].begin();
-  ::decode(cur_epoch, bp);
 
   *pepoch = cur_epoch;
   return 0;
 }
+
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic warning "-Wpragmas"
 
 void PG::write_if_dirty(ObjectStore::Transaction& t)
 {
@@ -3159,8 +3243,16 @@ bool PG::sched_scrub()
     return false;
   }
 
-  bool time_for_deep = (ceph_clock_now(cct) >
+  bool time_for_deep = (ceph_clock_now(cct) >=
     info.history.last_deep_scrub_stamp + cct->_conf->osd_deep_scrub_interval);
+
+  bool deep_coin_flip = false;
+  // Only add random deep scrubs when NOT user initiated scrub
+  if (!scrubber.must_scrub)
+      deep_coin_flip = (rand() % 100) < cct->_conf->osd_deep_scrub_randomize_ratio * 100;
+  dout(20) << __func__ << ": time_for_deep=" << time_for_deep << " deep_coin_flip=" << deep_coin_flip << dendl;
+
+  time_for_deep = (time_for_deep || deep_coin_flip);
 
   //NODEEP_SCRUB so ignore time initiated deep-scrub
   if (osd->osd->get_osdmap()->test_flag(CEPH_OSDMAP_NODEEP_SCRUB) ||
@@ -3174,6 +3266,21 @@ bool PG::sched_scrub()
     if ((osd->osd->get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
 	 pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB)) && !time_for_deep)
       return false;
+  }
+
+  if (cct->_conf->osd_scrub_auto_repair
+      && get_pgbackend()->auto_repair_supported()
+      && time_for_deep
+      // respect the command from user, and not do auto-repair
+      && !scrubber.must_repair
+      && !scrubber.must_scrub
+      && !scrubber.must_deep_scrub) {
+    dout(20) << __func__ << ": auto repair with deep scrubbing" << dendl;
+    scrubber.auto_repair = true;
+  } else {
+    // this happens when user issue the scrub/repair command during
+    // the scheduling of the scrub/repair (e.g. request reservation)
+    scrubber.auto_repair = false;
   }
 
   bool ret = true;
@@ -3484,8 +3591,18 @@ void PG::_scan_snaps(ScrubMap &smap)
     if (hoid.snap < CEPH_MAXSNAP) {
       // fake nlinks for old primaries
       bufferlist bl;
+      if (o.attrs.find(OI_ATTR) == o.attrs.end()) {
+	o.nlinks = 0;
+	continue;
+      }
       bl.push_back(o.attrs[OI_ATTR]);
-      object_info_t oi(bl);
+      object_info_t oi;
+      try {
+	oi = bl;
+      } catch(...) {
+	o.nlinks = 0;
+	continue;
+      }
       if (oi.snaps.empty()) {
 	// Just head
 	o.nlinks = 1;
@@ -3917,12 +4034,14 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
 
         // walk the log to find the latest update that affects our chunk
         scrubber.subset_last_update = pg_log.get_tail();
-        for (list<pg_log_entry_t>::const_iterator p = pg_log.get_log().log.begin();
-             p != pg_log.get_log().log.end();
+        for (list<pg_log_entry_t>::const_reverse_iterator p = pg_log.get_log().log.rbegin();
+             p != pg_log.get_log().log.rend();
              ++p) {
           if (cmp(p->soid, scrubber.start, get_sort_bitwise()) >= 0 &&
-	      cmp(p->soid, scrubber.end, get_sort_bitwise()) < 0)
+	      cmp(p->soid, scrubber.end, get_sort_bitwise()) < 0) {
             scrubber.subset_last_update = p->version;
+            break;
+          }
         }
 
         // ask replicas to wait until last_update_applied >= scrubber.subset_last_update and then scan
@@ -4147,7 +4266,7 @@ void PG::scrub_compare_maps()
   _scrub(authmap, missing_digest);
 }
 
-void PG::scrub_process_inconsistent()
+bool PG::scrub_process_inconsistent()
 {
   dout(10) << __func__ << ": checking authoritative" << dendl;
   bool repair = state_test(PG_STATE_REPAIR);
@@ -4194,19 +4313,27 @@ void PG::scrub_process_inconsistent()
       }
     }
   }
+  return (!scrubber.authoritative.empty() && repair);
 }
 
 // the part that actually finalizes a scrub
 void PG::scrub_finish() 
 {
   bool repair = state_test(PG_STATE_REPAIR);
+  // if the repair request comes from auto-repair and large number of errors,
+  // we would like to cancel auto-repair
+  if (repair && scrubber.auto_repair
+      && scrubber.authoritative.size() > cct->_conf->osd_scrub_auto_repair_num_errors) {
+    state_clear(PG_STATE_REPAIR);
+    repair = false;
+  }
   bool deep_scrub = state_test(PG_STATE_DEEP_SCRUB);
   const char *mode = (repair ? "repair": (deep_scrub ? "deep-scrub" : "scrub"));
 
   // type-specific finish (can tally more errors)
   _scrub_finish();
 
-  scrub_process_inconsistent();
+  bool has_error = scrub_process_inconsistent();
 
   {
     stringstream oss;
@@ -4274,7 +4401,7 @@ void PG::scrub_finish()
   }
 
 
-  if (repair) {
+  if (has_error) {
     queue_peering_event(
       CephPeeringEvtRef(
 	new CephPeeringEvt(
@@ -4935,6 +5062,8 @@ ostream& operator<<(ostream& out, const PG& pg)
 
   if (pg.scrubber.must_repair)
     out << " MUST_REPAIR";
+  if (pg.scrubber.auto_repair)
+    out << " AUTO_REPAIR";
   if (pg.scrubber.must_deep_scrub)
     out << " MUST_DEEP_SCRUB";
   if (pg.scrubber.must_scrub)
@@ -4983,22 +5112,6 @@ bool PG::can_discard_op(OpRequestRef& op)
     return true;
   }
 
-  if ((m->get_flags() & (CEPH_OSD_FLAG_BALANCE_READS |
-			 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
-      op->may_read() &&
-      !(op->may_write() || op->may_cache())) {
-    // balanced reads; any replica will do
-    if (!(is_primary() || is_replica())) {
-      osd->handle_misdirected_op(this, op);
-      return true;
-    }
-  } else {
-    // normal case; must be primary
-    if (!is_primary()) {
-      osd->handle_misdirected_op(this, op);
-      return true;
-    }
-  }
   if (is_replay()) {
     if (m->get_version().version > 0) {
       dout(7) << " queueing replay at " << m->get_version()
@@ -6398,11 +6511,11 @@ boost::statechart::result PG::RecoveryState::Active::react(const ActMap&)
   if (unfound > 0 &&
       pg->all_unfound_are_queried_or_lost(pg->get_osdmap())) {
     if (pg->cct->_conf->osd_auto_mark_unfound_lost) {
-      pg->osd->clog->error() << pg->info.pgid << " has " << unfound
+      pg->osd->clog->error() << pg->info.pgid.pgid << " has " << unfound
 			    << " objects unfound and apparently lost, would automatically marking lost but NOT IMPLEMENTED\n";
       //pg->mark_all_unfound_lost(*context< RecoveryMachine >().get_cur_transaction());
     } else
-      pg->osd->clog->error() << pg->info.pgid << " has " << unfound << " objects unfound and apparently lost\n";
+      pg->osd->clog->error() << pg->info.pgid.pgid << " has " << unfound << " objects unfound and apparently lost\n";
   }
 
   if (!pg->snap_trimq.empty() &&

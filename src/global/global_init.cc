@@ -34,10 +34,6 @@
 
 #include <errno.h>
 #include <deque>
-#ifdef WITH_LTTNG
-#include <lttng/ust.h>
-#endif
-
 
 #define dout_subsys ceph_subsys_
 
@@ -261,7 +257,7 @@ static void pidfile_remove_void(void)
   pidfile_remove();
 }
 
-int global_init_prefork(CephContext *cct, int flags)
+int global_init_prefork(CephContext *cct)
 {
   if (g_code_env != CODE_ENVIRONMENT_DAEMON)
     return -1;
@@ -283,15 +279,10 @@ int global_init_prefork(CephContext *cct, int flags)
   return 0;
 }
 
-void global_init_daemonize(CephContext *cct, int flags)
+void global_init_daemonize(CephContext *cct)
 {
-  if (global_init_prefork(cct, flags) < 0)
+  if (global_init_prefork(cct) < 0)
     return;
-
-#ifdef WITH_LTTNG
-  sigset_t sigset;
-  ust_before_fork(&sigset);
-#endif
 
   int ret = daemon(1, 1);
   if (ret) {
@@ -301,11 +292,8 @@ void global_init_daemonize(CephContext *cct, int flags)
     exit(1);
   }
 
-#ifdef WITH_LTTNG
-  ust_after_fork_child(&sigset);
-#endif
   global_init_postfork_start(cct);
-  global_init_postfork_finish(cct, flags);
+  global_init_postfork_finish(cct);
 }
 
 void global_init_postfork_start(CephContext *cct)
@@ -344,13 +332,13 @@ void global_init_postfork_start(CephContext *cct)
   pidfile_write(g_conf);
 }
 
-void global_init_postfork_finish(CephContext *cct, int flags)
+void global_init_postfork_finish(CephContext *cct)
 {
   /* We only close stderr once the caller decides the daemonization
    * process is finished.  This way we can allow error messages to be
    * propagated in a manner that the user is able to see.
    */
-  if (!(flags & CINIT_FLAG_NO_CLOSE_STDERR)) {
+  if (!(cct->get_init_flags() & CINIT_FLAG_NO_CLOSE_STDERR)) {
     int ret = global_init_shutdown_stderr(cct);
     if (ret) {
       derr << "global_init_daemonize: global_init_shutdown_stderr failed with "
